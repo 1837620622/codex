@@ -360,10 +360,13 @@ pub fn parse_git_apply_output(
     let mut conflicted = std::collections::BTreeSet::new();
     let mut last_seen_path: Option<String> = None;
 
-    fn add(set: &mut std::collections::BTreeSet<String>, raw: &str) {
+    /// Insert `raw` (after unquoting) into `set` and return the inserted path.
+    /// Callers must use this return value rather than `BTreeSet::iter().next_back()`,
+    /// which is the lexicographic max and not the just-inserted path.
+    fn add(set: &mut std::collections::BTreeSet<String>, raw: &str) -> Option<String> {
         let trimmed = raw.trim();
         if trimmed.is_empty() {
-            return;
+            return None;
         }
         let first = trimmed.chars().next().unwrap_or('\0');
         let last = trimmed.chars().last().unwrap_or('\0');
@@ -372,9 +375,11 @@ pub fn parse_git_apply_output(
         } else {
             trimmed.to_string()
         };
-        if !unquoted.is_empty() {
-            set.insert(unquoted);
+        if unquoted.is_empty() {
+            return None;
         }
+        set.insert(unquoted.clone());
+        Some(unquoted)
     }
 
     static APPLIED_CLEAN: Lazy<Regex> =
@@ -454,52 +459,44 @@ pub fn parse_git_apply_output(
 
         // === Status lines ===
         if let Some(c) = APPLIED_CLEAN.captures(line) {
-            if let Some(m) = c.name("path") {
-                add(&mut applied, m.as_str());
-                let p = applied.iter().next_back().cloned();
-                if let Some(p) = p {
-                    conflicted.remove(&p);
-                    skipped.remove(&p);
-                    last_seen_path = Some(p);
-                }
+            if let Some(m) = c.name("path")
+                && let Some(p) = add(&mut applied, m.as_str())
+            {
+                conflicted.remove(&p);
+                skipped.remove(&p);
+                last_seen_path = Some(p);
             }
             continue;
         }
         if let Some(c) = APPLIED_CONFLICTS.captures(line) {
-            if let Some(m) = c.name("path") {
-                add(&mut conflicted, m.as_str());
-                let p = conflicted.iter().next_back().cloned();
-                if let Some(p) = p {
-                    applied.remove(&p);
-                    skipped.remove(&p);
-                    last_seen_path = Some(p);
-                }
+            if let Some(m) = c.name("path")
+                && let Some(p) = add(&mut conflicted, m.as_str())
+            {
+                applied.remove(&p);
+                skipped.remove(&p);
+                last_seen_path = Some(p);
             }
             continue;
         }
         if let Some(c) = APPLYING_WITH_REJECTS.captures(line) {
-            if let Some(m) = c.name("path") {
-                add(&mut conflicted, m.as_str());
-                let p = conflicted.iter().next_back().cloned();
-                if let Some(p) = p {
-                    applied.remove(&p);
-                    skipped.remove(&p);
-                    last_seen_path = Some(p);
-                }
+            if let Some(m) = c.name("path")
+                && let Some(p) = add(&mut conflicted, m.as_str())
+            {
+                applied.remove(&p);
+                skipped.remove(&p);
+                last_seen_path = Some(p);
             }
             continue;
         }
 
         // === “U <path>” after conflicts ===
         if let Some(c) = UNMERGED_LINE.captures(line) {
-            if let Some(m) = c.name("path") {
-                add(&mut conflicted, m.as_str());
-                let p = conflicted.iter().next_back().cloned();
-                if let Some(p) = p {
-                    applied.remove(&p);
-                    skipped.remove(&p);
-                    last_seen_path = Some(p);
-                }
+            if let Some(m) = c.name("path")
+                && let Some(p) = add(&mut conflicted, m.as_str())
+            {
+                applied.remove(&p);
+                skipped.remove(&p);
+                last_seen_path = Some(p);
             }
             continue;
         }
@@ -510,9 +507,9 @@ pub fn parse_git_apply_output(
                 .captures(line)
                 .or_else(|| DOES_NOT_APPLY.captures(line))
                 && let Some(m) = c.name("path")
+                && let Some(p) = add(&mut skipped, m.as_str())
             {
-                add(&mut skipped, m.as_str());
-                last_seen_path = Some(m.as_str().to_string());
+                last_seen_path = Some(p);
             }
             continue;
         }
@@ -545,28 +542,24 @@ pub fn parse_git_apply_output(
             .or_else(|| CANNOT_READ_CURRENT.captures(line))
             .or_else(|| SKIPPED_PATCH.captures(line))
         {
-            if let Some(m) = c.name("path") {
-                add(&mut skipped, m.as_str());
-                let p_now = skipped.iter().next_back().cloned();
-                if let Some(p) = p_now {
-                    applied.remove(&p);
-                    conflicted.remove(&p);
-                    last_seen_path = Some(p);
-                }
+            if let Some(m) = c.name("path")
+                && let Some(p) = add(&mut skipped, m.as_str())
+            {
+                applied.remove(&p);
+                conflicted.remove(&p);
+                last_seen_path = Some(p);
             }
             continue;
         }
 
         // === Warnings that imply conflicts ===
         if let Some(c) = CANNOT_MERGE_BINARY_WARN.captures(line) {
-            if let Some(m) = c.name("path") {
-                add(&mut conflicted, m.as_str());
-                let p = conflicted.iter().next_back().cloned();
-                if let Some(p) = p {
-                    applied.remove(&p);
-                    skipped.remove(&p);
-                    last_seen_path = Some(p);
-                }
+            if let Some(m) = c.name("path")
+                && let Some(p) = add(&mut conflicted, m.as_str())
+            {
+                applied.remove(&p);
+                skipped.remove(&p);
+                last_seen_path = Some(p);
             }
             continue;
         }
@@ -661,6 +654,39 @@ mod tests {
         assert_eq!(applied, Vec::<String>::new());
         assert_eq!(conflicted, Vec::<String>::new());
         assert_eq!(skipped, vec!["hello\tworld.txt".to_string()]);
+    }
+
+    /// Regression: `last_seen_path` / cross-set removal must track the path just
+    /// classified, not `BTreeSet::iter().next_back()` (lexicographic max).
+    /// With two applied paths where the later one is lexicographically smaller,
+    /// a following THREE_WAY_FAILED line must de-apply the later path only.
+    #[test]
+    fn parse_output_attributes_three_way_failure_to_last_seen_not_set_max() {
+        let stderr = "\
+Applied patch zzz.txt cleanly.
+Applied patch aaa.txt cleanly.
+Failed to perform three-way merge...
+";
+        let (applied, skipped, conflicted) = parse_git_apply_output("", stderr);
+        assert_eq!(conflicted, Vec::<String>::new());
+        assert_eq!(applied, vec!["zzz.txt".to_string()]);
+        assert_eq!(skipped, vec!["aaa.txt".to_string()]);
+    }
+
+    /// Same next_back() class of bug for skip classification: inserting a
+    /// lexicographically smaller skip must remove that path from applied, not
+    /// the set max.
+    #[test]
+    fn parse_output_skip_removes_inserted_path_not_set_max() {
+        let stderr = "\
+Applied patch zzz.txt cleanly.
+Applied patch aaa.txt cleanly.
+error: aaa.txt: does not match index
+";
+        let (applied, skipped, conflicted) = parse_git_apply_output("", stderr);
+        assert_eq!(conflicted, Vec::<String>::new());
+        assert_eq!(applied, vec!["zzz.txt".to_string()]);
+        assert_eq!(skipped, vec!["aaa.txt".to_string()]);
     }
 
     #[test]
