@@ -155,18 +155,34 @@ fn bash_snapshot_redacts_secret_exports() -> Result<()> {
         .arg(bash_snapshot_script())
         .env("BASH_ENV", "/dev/null")
         .env("VALID_NAME", "ok")
+        .env("AWS_REGION", "us-east-1")
+        .env("AZURE_SUBSCRIPTION_ID", "sub-123")
         .env("OPENAI_API_KEY", "sk-should-not-appear")
         .env("OP_SERVICE_ACCOUNT_TOKEN", "ops_should-not-appear")
         .env("MY_CUSTOM_TOKEN", "token-should-not-appear")
         .env("DB_PASSWORD", "password-should-not-appear")
         .env("APP_SECRET", "secret-should-not-appear")
         .env("AWS_SECRET_ACCESS_KEY", "aws-should-not-appear")
+        .env("PGPASSWORD", "pg-should-not-appear")
+        .env("API_KEY", "apikey-should-not-appear")
+        .env("SECRET_KEY", "secretkey-should-not-appear")
+        .env("DATABASE_URL", "postgres://u:p@localhost/db")
+        .env("OP_SESSION", "opsession-should-not-appear")
         .output()?;
 
     assert!(output.status.success());
 
     let stdout = String::from_utf8_lossy(&output.stdout);
+    // Non-secret / operational env must remain replayable.
     assert!(stdout.contains("VALID_NAME"));
+    assert!(
+        stdout.contains("AWS_REGION"),
+        "AWS_REGION must remain in snapshots"
+    );
+    assert!(
+        stdout.contains("AZURE_SUBSCRIPTION_ID"),
+        "AZURE_SUBSCRIPTION_ID must remain in snapshots"
+    );
     assert!(
         !stdout.contains("sk-should-not-appear"),
         "OPENAI_API_KEY value must not be persisted in snapshots"
@@ -191,13 +207,46 @@ fn bash_snapshot_redacts_secret_exports() -> Result<()> {
         !stdout.contains("aws-should-not-appear"),
         "AWS_* secrets must not be persisted in snapshots"
     );
-    // Names should also be omitted, not only values.
-    assert!(!stdout.contains("OPENAI_API_KEY"));
-    assert!(!stdout.contains("OP_SERVICE_ACCOUNT_TOKEN"));
-    assert!(!stdout.contains("MY_CUSTOM_TOKEN"));
-    assert!(!stdout.contains("DB_PASSWORD"));
-    assert!(!stdout.contains("APP_SECRET"));
-    assert!(!stdout.contains("AWS_SECRET_ACCESS_KEY"));
+    assert!(
+        !stdout.contains("pg-should-not-appear"),
+        "PGPASSWORD value must not be persisted in snapshots"
+    );
+    assert!(
+        !stdout.contains("apikey-should-not-appear"),
+        "API_KEY value must not be persisted in snapshots"
+    );
+    assert!(
+        !stdout.contains("secretkey-should-not-appear"),
+        "SECRET_KEY value must not be persisted in snapshots"
+    );
+    assert!(
+        !stdout.contains("postgres://u:p@localhost/db"),
+        "DATABASE_URL value must not be persisted in snapshots"
+    );
+    assert!(
+        !stdout.contains("opsession-should-not-appear"),
+        "OP_SESSION value must not be persisted in snapshots"
+    );
+    // Names should also be omitted, not only values (match declare/export forms).
+    for name in [
+        "OPENAI_API_KEY",
+        "OP_SERVICE_ACCOUNT_TOKEN",
+        "MY_CUSTOM_TOKEN",
+        "DB_PASSWORD",
+        "APP_SECRET",
+        "AWS_SECRET_ACCESS_KEY",
+        "PGPASSWORD",
+        "API_KEY",
+        "SECRET_KEY",
+        "DATABASE_URL",
+        "OP_SESSION",
+    ] {
+        assert!(
+            !stdout.contains(&format!(" {name}="))
+                && !stdout.contains(&format!("declare -x {name}")),
+            "secret export name {name} must be omitted from snapshots"
+        );
+    }
 
     Ok(())
 }
@@ -207,17 +256,83 @@ fn excluded_export_name_ere_covers_secret_patterns() {
     let ere = excluded_export_name_ere();
     // Exact denylist names are emitted as ^NAME$ fragments.
     assert!(ere.contains("^PWD$"));
-    assert!(ere.contains("^OPENAI_API_KEY$"));
-    assert!(ere.contains("^OP_SERVICE_ACCOUNT_TOKEN$"));
+    assert!(ere.contains("^PGPASSWORD$"));
+    assert!(ere.contains("^API_KEY$"));
+    assert!(ere.contains("^OP_SESSION$"));
+    assert!(ere.contains("^DATABASE_URL$"));
+    // Pattern-covered names should not bloat the exact list.
+    assert!(!ere.contains("^OPENAI_API_KEY$"));
+    assert!(!ere.contains("^GITHUB_TOKEN$"));
     // Suffix / prefix patterns for common secret-bearing names.
     assert!(ere.contains(".*_TOKEN$"));
     assert!(ere.contains(".*_SECRET$"));
     assert!(ere.contains(".*_PASSWORD$"));
+    assert!(ere.contains(".*_API_KEY$"));
     assert!(ere.contains("^AWS_SECRET"));
     // Non-secret names must not appear as exact exclusions.
     assert!(!ere.contains("^PATH$"));
     assert!(!ere.contains("^HOME$"));
+    assert!(!ere.contains("^AWS_REGION$"));
     assert!(!ere.contains("^VALID_NAME$"));
+}
+
+/// Full-name matching helper shared by unit checks (mirrors shell `~` / `=~`).
+fn export_name_is_excluded(name: &str) -> bool {
+    let ere = excluded_export_name_ere();
+    regex_lite::Regex::new(&ere)
+        .expect("excluded export ERE compiles")
+        .is_match(name)
+}
+
+#[test]
+fn excluded_export_name_ere_blocks_secrets_and_keeps_safe_names() {
+    for name in [
+        "PWD",
+        "OPENAI_API_KEY",
+        "GITHUB_TOKEN",
+        "MY_CUSTOM_TOKEN",
+        "DB_PASSWORD",
+        "APP_SECRET",
+        "AWS_SECRET_ACCESS_KEY",
+        "AWS_ACCESS_KEY_ID",
+        "AWS_SESSION_TOKEN",
+        "AZURE_CLIENT_SECRET",
+        "GOOGLE_APPLICATION_CREDENTIALS",
+        "PGPASSWORD",
+        "API_KEY",
+        "SECRET_KEY",
+        "OP_SESSION",
+        "DATABASE_URL",
+        "AUTH_TOKEN",
+    ] {
+        assert!(
+            export_name_is_excluded(name),
+            "expected {name} to be excluded from snapshots"
+        );
+    }
+
+    for name in [
+        "PATH",
+        "HOME",
+        "AWS_REGION",
+        "AWS_DEFAULT_REGION",
+        "AWS_PROFILE",
+        "AZURE_SUBSCRIPTION_ID",
+        "AZURE_CLIENT_ID",
+        "AZURE_TENANT_ID",
+        "VALID_NAME",
+        "TERM",
+        "EDITOR",
+        "LANG",
+        "GITHUB_ACTIONS",
+        // Ends with TOKENS (plural), not _TOKEN — must remain.
+        "CLAUDE_CODE_MAX_OUTPUT_TOKENS",
+    ] {
+        assert!(
+            !export_name_is_excluded(name),
+            "expected {name} to remain in snapshots"
+        );
+    }
 }
 
 #[cfg(unix)]

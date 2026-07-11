@@ -44,37 +44,45 @@ const SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(10);
 const SNAPSHOT_RETENTION: Duration = Duration::from_secs(60 * 60 * 24 * 3); // 3 days retention.
 const SNAPSHOT_DIR: &str = "shell_snapshots";
 /// Exact env names never written into shell snapshot files.
+///
+/// Keep this list to names that the suffix/prefix patterns below do **not**
+/// already cover (plus non-secret functional exclusions like `PWD`).
+/// Pattern-covered names such as `OPENAI_API_KEY` / `GITHUB_TOKEN` /
+/// `AWS_SECRET_ACCESS_KEY` are intentionally omitted to avoid denylist drift.
 const EXCLUDED_EXPORT_VARS: &[&str] = &[
+    // Functional: do not replay cwd from a different process.
     "PWD",
     "OLDPWD",
-    // High-signal credential names that do not always match the suffix patterns.
-    "OPENAI_API_KEY",
-    "ANTHROPIC_API_KEY",
-    "ANTHROPIC_AUTH_TOKEN",
-    "GITHUB_TOKEN",
-    "GH_TOKEN",
-    "GH_ENTERPRISE_TOKEN",
-    "NPM_TOKEN",
-    "NODE_AUTH_TOKEN",
-    "OP_SERVICE_ACCOUNT_TOKEN",
-    "OP_CONNECT_TOKEN",
+    // Bare credential names (no `_` suffix for the patterns below).
+    "API_KEY",
+    "SECRET_KEY",
+    "SECRET",
+    "PASSWORD",
+    "PASSWD",
+    "TOKEN",
+    // Common tool names that do not match `_*PASSWORD` / `_*TOKEN` suffixes.
+    "PGPASSWORD",
+    "MYSQL_PWD",
     "OP_SESSION",
-    "GOOGLE_APPLICATION_CREDENTIALS",
-    "CLOUDSDK_AUTH_ACCESS_TOKEN",
-    "AZURE_CLIENT_SECRET",
-    "AWS_ACCESS_KEY_ID",
-    "AWS_SECRET_ACCESS_KEY",
-    "AWS_SESSION_TOKEN",
-    "AWS_SECURITY_TOKEN",
-    "DIGITALOCEAN_ACCESS_TOKEN",
-    "DOCKER_PASSWORD",
-    "HUGGING_FACE_HUB_TOKEN",
-    "HF_TOKEN",
-    "CODEX_API_KEY",
+    // Connection URIs frequently embed passwords; name has no secret suffix.
+    "DATABASE_URL",
+    "REDIS_URL",
+    "MONGODB_URI",
+    "MONGO_URL",
+    "POSTGRES_URL",
+    "POSTGRESQL_URL",
+    "MYSQL_URL",
+    "CONNECTION_STRING",
 ];
-/// awk/ERE patterns (unanchored name match uses these after exact names).
-/// Applied as: name matches any of these regexes → exclude from snapshot.
+/// awk/ERE / bash ERE / .NET patterns matched against the **full variable name**.
+///
+/// Important: each alternative below carries its own anchors where needed.
+/// Call sites must use an **unanchored** container (`name ~ /PAT/` /
+/// `[[ $name =~ PAT ]]` / `-notmatch PAT`) and must **not** wrap the combined
+/// expression in an extra `^(...)$` — that would break prefix patterns such as
+/// `^AWS_SECRET` (they would no longer match `AWS_SECRET_ACCESS_KEY`).
 const EXCLUDED_EXPORT_NAME_PATTERNS: &[&str] = &[
+    // Suffix heuristics for secret-bearing names.
     r".*_TOKEN$",
     r".*_SECRET$",
     r".*_PASSWORD$",
@@ -86,7 +94,6 @@ const EXCLUDED_EXPORT_NAME_PATTERNS: &[&str] = &[
     r".*_SECRET_KEY$",
     r".*_CREDENTIAL$",
     r".*_CREDENTIALS$",
-    r".*_AUTH_TOKEN$",
     // Narrow cloud prefixes: keep AWS_REGION / AZURE_SUBSCRIPTION_ID replayable.
     r"^AWS_SECRET",
     r"^AWS_ACCESS_KEY",
@@ -362,13 +369,11 @@ async fn run_script_with_timeout(
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
-fn excluded_exports_regex() -> String {
-    EXCLUDED_EXPORT_VARS.join("|")
-}
-
 /// Combined ERE used by snapshot shell scripts to drop secret-bearing exports.
-/// Matches exact names from [`EXCLUDED_EXPORT_VARS`] or name patterns from
-/// [`EXCLUDED_EXPORT_NAME_PATTERNS`].
+///
+/// Exact names from [`EXCLUDED_EXPORT_VARS`] are emitted as `^NAME$` alternatives;
+/// patterns from [`EXCLUDED_EXPORT_NAME_PATTERNS`] are appended as-is. The result
+/// is matched without an outer `^(...)$` wrapper (see pattern list docs).
 fn excluded_export_name_ere() -> String {
     let mut parts: Vec<String> = Vec::with_capacity(
         EXCLUDED_EXPORT_VARS.len() + EXCLUDED_EXPORT_NAME_PATTERNS.len(),
