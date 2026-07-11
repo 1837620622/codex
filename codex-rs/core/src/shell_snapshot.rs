@@ -43,7 +43,58 @@ pub(crate) struct ShellSnapshotFile {
 const SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(10);
 const SNAPSHOT_RETENTION: Duration = Duration::from_secs(60 * 60 * 24 * 3); // 3 days retention.
 const SNAPSHOT_DIR: &str = "shell_snapshots";
-const EXCLUDED_EXPORT_VARS: &[&str] = &["PWD", "OLDPWD"];
+/// Exact env names never written into shell snapshot files.
+const EXCLUDED_EXPORT_VARS: &[&str] = &[
+    "PWD",
+    "OLDPWD",
+    // High-signal credential names that do not always match the suffix patterns.
+    "OPENAI_API_KEY",
+    "ANTHROPIC_API_KEY",
+    "ANTHROPIC_AUTH_TOKEN",
+    "GITHUB_TOKEN",
+    "GH_TOKEN",
+    "GH_ENTERPRISE_TOKEN",
+    "NPM_TOKEN",
+    "NODE_AUTH_TOKEN",
+    "OP_SERVICE_ACCOUNT_TOKEN",
+    "OP_CONNECT_TOKEN",
+    "OP_SESSION",
+    "GOOGLE_APPLICATION_CREDENTIALS",
+    "CLOUDSDK_AUTH_ACCESS_TOKEN",
+    "AZURE_CLIENT_SECRET",
+    "AWS_ACCESS_KEY_ID",
+    "AWS_SECRET_ACCESS_KEY",
+    "AWS_SESSION_TOKEN",
+    "AWS_SECURITY_TOKEN",
+    "DIGITALOCEAN_ACCESS_TOKEN",
+    "DOCKER_PASSWORD",
+    "HUGGING_FACE_HUB_TOKEN",
+    "HF_TOKEN",
+    "CODEX_API_KEY",
+];
+/// awk/ERE patterns (unanchored name match uses these after exact names).
+/// Applied as: name matches any of these regexes → exclude from snapshot.
+const EXCLUDED_EXPORT_NAME_PATTERNS: &[&str] = &[
+    r".*_TOKEN$",
+    r".*_SECRET$",
+    r".*_PASSWORD$",
+    r".*_PASSWD$",
+    r".*_PASSPHRASE$",
+    r".*_API_KEY$",
+    r".*_PRIVATE_KEY$",
+    r".*_ACCESS_KEY$",
+    r".*_SECRET_KEY$",
+    r".*_CREDENTIAL$",
+    r".*_CREDENTIALS$",
+    r".*_AUTH_TOKEN$",
+    // Narrow cloud prefixes: keep AWS_REGION / AZURE_SUBSCRIPTION_ID replayable.
+    r"^AWS_SECRET",
+    r"^AWS_ACCESS_KEY",
+    r"^AWS_SESSION_TOKEN$",
+    r"^AWS_SECURITY_TOKEN$",
+    r"^AZURE_.*SECRET",
+    r"^AZURE_.*KEY$",
+];
 
 impl ShellSnapshot {
     pub(crate) fn new(
@@ -230,7 +281,7 @@ async fn capture_snapshot(shell: &Shell, cwd: &AbsolutePathBuf) -> Result<String
         ShellType::Zsh => run_shell_script(shell, &zsh_snapshot_script(), cwd).await,
         ShellType::Bash => run_shell_script(shell, &bash_snapshot_script(), cwd).await,
         ShellType::Sh => run_shell_script(shell, &sh_snapshot_script(), cwd).await,
-        ShellType::PowerShell => run_shell_script(shell, powershell_snapshot_script(), cwd).await,
+        ShellType::PowerShell => run_shell_script(shell, &powershell_snapshot_script(), cwd).await,
         ShellType::Cmd => bail!("Shell snapshotting is not yet supported for {shell_type:?}"),
     }
 }
@@ -315,8 +366,24 @@ fn excluded_exports_regex() -> String {
     EXCLUDED_EXPORT_VARS.join("|")
 }
 
+/// Combined ERE used by snapshot shell scripts to drop secret-bearing exports.
+/// Matches exact names from [`EXCLUDED_EXPORT_VARS`] or name patterns from
+/// [`EXCLUDED_EXPORT_NAME_PATTERNS`].
+fn excluded_export_name_ere() -> String {
+    let mut parts: Vec<String> = Vec::with_capacity(
+        EXCLUDED_EXPORT_VARS.len() + EXCLUDED_EXPORT_NAME_PATTERNS.len(),
+    );
+    for name in EXCLUDED_EXPORT_VARS {
+        parts.push(format!("^{name}$"));
+    }
+    for pattern in EXCLUDED_EXPORT_NAME_PATTERNS {
+        parts.push((*pattern).to_string());
+    }
+    parts.join("|")
+}
+
 fn zsh_snapshot_script() -> String {
-    let excluded = excluded_exports_regex();
+    let excluded = excluded_export_name_ere();
     let script = r##"if [[ -n "$ZDOTDIR" ]]; then
   rc="$ZDOTDIR/.zshrc"
 else
@@ -343,7 +410,7 @@ export_lines=$(export -p | awk '
   name=line
   sub(/^(export|declare -x|typeset -x) /, "", name)
   sub(/=.*/, "", name)
-  if (name ~ /^(EXCLUDED_EXPORTS)$/) {
+  if (name ~ /EXCLUDED_EXPORTS/) {
     next
   }
   if (name ~ /^[A-Za-z_][A-Za-z0-9_]*$/) {
@@ -360,7 +427,7 @@ fi
 }
 
 fn bash_snapshot_script() -> String {
-    let excluded = excluded_exports_regex();
+    let excluded = excluded_export_name_ere();
     let script = r##"if [ -z "$BASH_ENV" ] && [ -r "$HOME/.bashrc" ]; then
   . "$HOME/.bashrc"
 fi
@@ -383,7 +450,7 @@ alias -p
 echo ''
 export_lines=$(
   while IFS= read -r name; do
-    if [[ "$name" =~ ^(EXCLUDED_EXPORTS)$ ]]; then
+    if [[ "$name" =~ EXCLUDED_EXPORTS ]]; then
       continue
     fi
     if [[ ! "$name" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then
@@ -402,7 +469,7 @@ fi
 }
 
 fn sh_snapshot_script() -> String {
-    let excluded = excluded_exports_regex();
+    let excluded = excluded_export_name_ere();
     let script = r##"if [ -n "$ENV" ] && [ -r "$ENV" ]; then
   . "$ENV"
 fi
@@ -442,7 +509,7 @@ if export -p >/dev/null 2>&1; then
   name=line
   sub(/^(export|declare -x|typeset -x) /, "", name)
   sub(/=.*/, "", name)
-  if (name ~ /^(EXCLUDED_EXPORTS)$/) {
+  if (name ~ /EXCLUDED_EXPORTS/) {
     next
   }
   if (name ~ /^[A-Za-z_][A-Za-z0-9_]*$/) {
@@ -455,12 +522,19 @@ if export -p >/dev/null 2>&1; then
     printf '%s\n' "$export_lines"
   fi
 else
-  export_count=$(env | sort | awk -F= '$1 ~ /^[A-Za-z_][A-Za-z0-9_]*$/ { count++ } END { print count }')
+  export_count=$(env | sort | awk -F= '
+    $1 ~ /^[A-Za-z_][A-Za-z0-9_]*$/ && $1 !~ /EXCLUDED_EXPORTS/ { count++ }
+    END { print count+0 }
+  ')
   echo "# exports $export_count"
   env | sort | while IFS='=' read -r key value; do
     case "$key" in
-      ""|[0-9]*|*[!A-Za-z0-9_]*|EXCLUDED_EXPORTS) continue ;;
+      ""|[0-9]*|*[!A-Za-z0-9_]*) continue ;;
     esac
+    # Portable shell has no ERE; re-check with awk against the same denylist.
+    if printf '%s' "$key" | awk 'BEGIN{r=1} $0 ~ /EXCLUDED_EXPORTS/ {r=0} END{exit r}'; then
+      continue
+    fi
     escaped=$(printf "%s" "$value" | sed "s/'/'\"'\"'/g")
     printf "export %s='%s'\n" "$key" "$escaped"
   done
@@ -469,8 +543,10 @@ fi
     script.replace("EXCLUDED_EXPORTS", &excluded)
 }
 
-fn powershell_snapshot_script() -> &'static str {
-    r##"$ErrorActionPreference = 'Stop'
+fn powershell_snapshot_script() -> String {
+    let excluded = excluded_export_name_ere();
+    // PowerShell -match uses .NET regex; same denylist as POSIX shells.
+    let script = r##"$ErrorActionPreference = 'Stop'
 Write-Output '# Snapshot file'
 Write-Output '# Unset all aliases to avoid conflicts with functions'
 Write-Output 'Remove-Item Alias:* -ErrorAction SilentlyContinue'
@@ -485,13 +561,17 @@ $aliases | ForEach-Object {
     "Set-Alias -Name {0} -Value {1}" -f $_.Name, $_.Definition
 }
 Write-Output ''
-$envVars = Get-ChildItem Env:
+$excludedPattern = 'EXCLUDED_EXPORTS'
+$envVars = @(Get-ChildItem Env: | Where-Object {
+    $_.Name -match '^[A-Za-z_][A-Za-z0-9_]*$' -and $_.Name -notmatch $excludedPattern
+})
 Write-Output ("# exports " + $envVars.Count)
 $envVars | ForEach-Object {
     $escaped = $_.Value -replace "'", "''"
     "`$env:{0}='{1}'" -f $_.Name, $escaped
 }
-"##
+"##;
+    script.replace("EXCLUDED_EXPORTS", &excluded)
 }
 
 /// Removes shell snapshots that either lack a matching session rollout file or

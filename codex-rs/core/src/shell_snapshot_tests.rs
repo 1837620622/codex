@@ -149,6 +149,79 @@ fn bash_snapshot_filters_invalid_exports() -> Result<()> {
 
 #[cfg(unix)]
 #[test]
+fn bash_snapshot_redacts_secret_exports() -> Result<()> {
+    let output = Command::new("/bin/bash")
+        .arg("-c")
+        .arg(bash_snapshot_script())
+        .env("BASH_ENV", "/dev/null")
+        .env("VALID_NAME", "ok")
+        .env("OPENAI_API_KEY", "sk-should-not-appear")
+        .env("OP_SERVICE_ACCOUNT_TOKEN", "ops_should-not-appear")
+        .env("MY_CUSTOM_TOKEN", "token-should-not-appear")
+        .env("DB_PASSWORD", "password-should-not-appear")
+        .env("APP_SECRET", "secret-should-not-appear")
+        .env("AWS_SECRET_ACCESS_KEY", "aws-should-not-appear")
+        .output()?;
+
+    assert!(output.status.success());
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("VALID_NAME"));
+    assert!(
+        !stdout.contains("sk-should-not-appear"),
+        "OPENAI_API_KEY value must not be persisted in snapshots"
+    );
+    assert!(
+        !stdout.contains("ops_should-not-appear"),
+        "OP_SERVICE_ACCOUNT_TOKEN value must not be persisted in snapshots"
+    );
+    assert!(
+        !stdout.contains("token-should-not-appear"),
+        "*_TOKEN values must not be persisted in snapshots"
+    );
+    assert!(
+        !stdout.contains("password-should-not-appear"),
+        "*_PASSWORD values must not be persisted in snapshots"
+    );
+    assert!(
+        !stdout.contains("secret-should-not-appear"),
+        "*_SECRET values must not be persisted in snapshots"
+    );
+    assert!(
+        !stdout.contains("aws-should-not-appear"),
+        "AWS_* secrets must not be persisted in snapshots"
+    );
+    // Names should also be omitted, not only values.
+    assert!(!stdout.contains("OPENAI_API_KEY"));
+    assert!(!stdout.contains("OP_SERVICE_ACCOUNT_TOKEN"));
+    assert!(!stdout.contains("MY_CUSTOM_TOKEN"));
+    assert!(!stdout.contains("DB_PASSWORD"));
+    assert!(!stdout.contains("APP_SECRET"));
+    assert!(!stdout.contains("AWS_SECRET_ACCESS_KEY"));
+
+    Ok(())
+}
+
+#[test]
+fn excluded_export_name_ere_covers_secret_patterns() {
+    let ere = excluded_export_name_ere();
+    // Exact denylist names are emitted as ^NAME$ fragments.
+    assert!(ere.contains("^PWD$"));
+    assert!(ere.contains("^OPENAI_API_KEY$"));
+    assert!(ere.contains("^OP_SERVICE_ACCOUNT_TOKEN$"));
+    // Suffix / prefix patterns for common secret-bearing names.
+    assert!(ere.contains(".*_TOKEN$"));
+    assert!(ere.contains(".*_SECRET$"));
+    assert!(ere.contains(".*_PASSWORD$"));
+    assert!(ere.contains("^AWS_SECRET"));
+    // Non-secret names must not appear as exact exclusions.
+    assert!(!ere.contains("^PATH$"));
+    assert!(!ere.contains("^HOME$"));
+    assert!(!ere.contains("^VALID_NAME$"));
+}
+
+#[cfg(unix)]
+#[test]
 fn bash_snapshot_preserves_multiline_exports() -> Result<()> {
     let multiline_cert = "-----BEGIN CERTIFICATE-----\nabc\n-----END CERTIFICATE-----";
     let output = Command::new("/bin/bash")
