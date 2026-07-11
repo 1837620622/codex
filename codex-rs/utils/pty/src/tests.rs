@@ -775,6 +775,140 @@ async fn pipe_terminate_aborts_detached_readers() -> anyhow::Result<()> {
 
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pipe_terminate_reaps_child() -> anyhow::Result<()> {
+    let env_map: HashMap<String, String> = std::env::vars().collect();
+    let marker = "__codex_pipe_pid:";
+    let script = format!("echo {marker}$$; sleep 1000");
+    let (program, args) = shell_command(&script);
+    let spawned = spawn_pipe_process(&program, &args, Path::new("."), &env_map, &None).await?;
+    let (session, mut output_rx, exit_rx) = combine_spawned_output(spawned);
+
+    let child_pid = match wait_for_marker_pid(&mut output_rx, marker, /*timeout_ms*/ 2_000).await {
+        Ok(pid) => pid,
+        Err(err) => {
+            session.terminate();
+            return Err(err);
+        }
+    };
+    assert!(
+        process_exists(child_pid)?,
+        "expected pipe child pid {child_pid} to exist before terminate"
+    );
+
+    session.terminate();
+
+    let exit_code = tokio::time::timeout(tokio::time::Duration::from_secs(3), exit_rx)
+        .await
+        .map_err(|_| anyhow::anyhow!("timed out waiting for exit after pipe terminate"))?
+        .map_err(|_| anyhow::anyhow!("exit channel closed after pipe terminate"))?;
+    assert_ne!(
+        exit_code, -1,
+        "wait task should report a real exit status after terminate"
+    );
+
+    let exited = wait_for_process_exit(child_pid, /*timeout_ms*/ 3_000).await?;
+    assert!(
+        exited,
+        "pipe child pid {child_pid} remained as a zombie or alive after terminate()"
+    );
+    assert!(
+        session.has_exited(),
+        "ProcessHandle should observe exit after wait reaps the child"
+    );
+
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pipe_drop_reaps_child() -> anyhow::Result<()> {
+    let env_map: HashMap<String, String> = std::env::vars().collect();
+    let marker = "__codex_pipe_drop_pid:";
+    let script = format!("echo {marker}$$; sleep 1000");
+    let (program, args) = shell_command(&script);
+    let spawned = spawn_pipe_process(&program, &args, Path::new("."), &env_map, &None).await?;
+    let (session, mut output_rx, exit_rx) = combine_spawned_output(spawned);
+
+    let child_pid = match wait_for_marker_pid(&mut output_rx, marker, /*timeout_ms*/ 2_000).await {
+        Ok(pid) => pid,
+        Err(err) => {
+            session.terminate();
+            return Err(err);
+        }
+    };
+    assert!(
+        process_exists(child_pid)?,
+        "expected pipe child pid {child_pid} to exist before drop"
+    );
+
+    drop(session);
+
+    let _exit_code = tokio::time::timeout(tokio::time::Duration::from_secs(3), exit_rx)
+        .await
+        .map_err(|_| anyhow::anyhow!("timed out waiting for exit after pipe drop"))?
+        .map_err(|_| anyhow::anyhow!("exit channel closed after pipe drop"))?;
+
+    let exited = wait_for_process_exit(child_pid, /*timeout_ms*/ 3_000).await?;
+    assert!(
+        exited,
+        "pipe child pid {child_pid} remained as a zombie or alive after ProcessHandle drop"
+    );
+
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pty_terminate_reaps_child() -> anyhow::Result<()> {
+    let env_map: HashMap<String, String> = std::env::vars().collect();
+    let marker = "__codex_pty_pid:";
+    let script = format!("echo {marker}$$; sleep 1000");
+    let (program, args) = shell_command(&script);
+    let spawned = spawn_pty_process(
+        &program,
+        &args,
+        Path::new("."),
+        &env_map,
+        &None,
+        TerminalSize::default(),
+    )
+    .await?;
+    let (session, mut output_rx, exit_rx) = combine_spawned_output(spawned);
+
+    let child_pid = match wait_for_marker_pid(&mut output_rx, marker, /*timeout_ms*/ 2_000).await {
+        Ok(pid) => pid,
+        Err(err) => {
+            session.terminate();
+            return Err(err);
+        }
+    };
+    assert!(
+        process_exists(child_pid)?,
+        "expected PTY child pid {child_pid} to exist before terminate"
+    );
+
+    session.terminate();
+
+    let _exit_code = tokio::time::timeout(tokio::time::Duration::from_secs(3), exit_rx)
+        .await
+        .map_err(|_| anyhow::anyhow!("timed out waiting for exit after PTY terminate"))?
+        .map_err(|_| anyhow::anyhow!("exit channel closed after PTY terminate"))?;
+
+    let exited = wait_for_process_exit(child_pid, /*timeout_ms*/ 3_000).await?;
+    assert!(
+        exited,
+        "PTY child pid {child_pid} remained as a zombie or alive after terminate()"
+    );
+    assert!(
+        session.has_exited(),
+        "ProcessHandle should observe exit after wait reaps the PTY child"
+    );
+
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn pty_terminate_kills_background_children_in_same_process_group() -> anyhow::Result<()> {
     let env_map: HashMap<String, String> = std::env::vars().collect();
     let marker = "__codex_bg_pid:";

@@ -237,7 +237,12 @@ impl ProcessHandle {
         killer.signal(signal)
     }
 
-    /// Attempts to kill the child and abort helper tasks.
+    /// Attempts to kill the child and abort I/O helper tasks.
+    ///
+    /// The wait task is intentionally left running so it can reap the child after
+    /// termination. Aborting it would leave the process as a zombie under the
+    /// app-server parent. Dropping this handle detaches that task if it is still
+    /// running.
     pub fn terminate(&self) {
         self.request_terminate();
 
@@ -256,17 +261,17 @@ impl ProcessHandle {
         {
             handle.abort();
         }
-        if let Ok(mut h) = self.wait_handle.lock()
-            && let Some(handle) = h.take()
-        {
-            handle.abort();
-        }
     }
 }
 
 impl Drop for ProcessHandle {
     fn drop(&mut self) {
         self.terminate();
+        // Detach the reaper task without aborting it. Dropping the JoinHandle lets
+        // the wait continue in the background so the child is still reaped.
+        if let Ok(mut h) = self.wait_handle.lock() {
+            drop(h.take());
+        }
     }
 }
 
